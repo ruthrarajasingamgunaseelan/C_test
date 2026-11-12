@@ -1,0 +1,52 @@
+# PR-Agent review with codebase context (see review-context/README.md).
+#
+# Requirements on the runner: `pip install -e review-context` (or a wheel of it)
+# into ~/pr-agent-env. Linters (ruff, mypy, shellcheck, cppcheck, clippy, verilator, ghdl) are optional.
+#
+# No secret is written here. GITLAB_PERSONAL_ACCESS_TOKEN, OPENROUTER_API_KEY,
+# OPENROUTER_MODEL and CONTEXT_TOKENS stay in Settings > CI/CD > Variables.
+
+pr_agent_review:
+  stage: test
+  tags: [review]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    # Fetch the full history, so the MR base commit is present.
+    GIT_DEPTH: "0"
+    CONFIG__GIT_PROVIDER: "gitlab"
+    GITLAB__URL: "https://git.thakshana.com"
+    GITLAB__PERSONAL_ACCESS_TOKEN: $GITLAB_PERSONAL_ACCESS_TOKEN
+    OPENROUTER__KEY: $OPENROUTER_API_KEY
+    OPENROUTER__API_BASE: "https://openrouter.ai/api/v1"
+    CONFIG__MODEL: $OPENROUTER_MODEL
+    CONFIG__FALLBACK_MODELS: '["openrouter/deepseek/deepseek-chat"]'
+    CONFIG__CUSTOM_MODEL_MAX_TOKENS: $CONTEXT_TOKENS
+    # Show more of the surrounding code around each changed hunk.
+    CONFIG__ALLOW_DYNAMIC_CONTEXT: "true"
+    CONFIG__PATCH_EXTRA_LINES_BEFORE: "10"
+    CONFIG__PATCH_EXTRA_LINES_AFTER: "3"
+    CONFIG__MAX_MODEL_TOKENS: $CONTEXT_TOKENS
+
+  script:
+    - source ~/pr-agent-env/bin/activate
+    - MR_URL="$CI_MERGE_REQUEST_PROJECT_URL/-/merge_requests/$CI_MERGE_REQUEST_IID"
+    - python -m pr_agent.cli --pr_url "$MR_URL" describe
+    # Build the context. This step never fails the job: on any problem it
+    # writes an empty file and the review runs on the diff alone.
+    - review-context --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --head "$CI_COMMIT_SHA" --repo . --out context.md || true
+    # Hand the context to the review. Normally through an environment variable;
+    # a context above 100 KB goes through a settings file instead.
+    - |
+      if [ "$(review-context-inject context.md --toml context.toml || true)" = "toml" ]; then
+        python -m pr_agent.cli --pr_url "$MR_URL" --extra_config_url="$PWD/context.toml" review
+      else
+        PR_REVIEWER__EXTRA_INSTRUCTIONS="$(cat context.md 2>/dev/null || true)" \
+          python -m pr_agent.cli --pr_url "$MR_URL" review
+      fi
+      echo "Review finished. See the job artifacts for the context and the review report."
+  artifacts:
+    when: always
+    paths:
+      - context.md
+    expire_in: 1 week
